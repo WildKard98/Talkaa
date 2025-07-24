@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import './App.css';
 
 function App() {
@@ -11,75 +11,139 @@ function App() {
   const [sortType, setSortType] = useState('mostLiked');
   const [totalResults, setTotalResults] = useState(null);
   const [shouldStop, setShouldStop] = useState(false); // <-- ADD THIS
+  const [totalLoaded, setTotalLoaded] = useState(0);
 
   const extractVideoId = (url) => {
-    const match = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11})/);
+    const match = url.match(/(?:v=|\.be\/)([a-zA-Z0-9_-]{11})/);
     return match ? match[1] : null;
   };
 
-  const fetchComments = async (isNew = false) => {
-    const apiKey = import.meta.env.VITE_YOUTUBE_API_KEY;
-    let currentVideoId = videoId;
+  const typingTimeout = useRef(null);
 
-    if (isNew) {
-      currentVideoId = extractVideoId(videoLink);
-      if (!currentVideoId) {
-        alert("Invalid YouTube link");
-        return;
-      }
-      setVideoId(currentVideoId);
-      setComments([]);
-      setNextPageToken(null);
-      setTotalResults(null);
-      setShouldStop(false); // 🆕 reset cancel flag
-    }
+  useEffect(() => {
+    if (typingTimeout.current) clearTimeout(typingTimeout.current);
 
-    if (!apiKey || !currentVideoId) {
-      alert("Missing API key or video ID");
-      return;
-    }
+    typingTimeout.current = setTimeout(() => {
+      const id = extractVideoId(videoLink.trim());
+      if (!id || id.length !== 11) return;
 
-    setLoading(true);
-    let pageToken = isNew ? null : nextPageToken;
-    let done = false;
+      const loadFromDatabase = async () => {
+        setLoading(true);
+        setVideoId(id);
 
-    try {
-      while (!done && !shouldStop) {
-        let url = `https://www.googleapis.com/youtube/v3/commentThreads?key=${apiKey}&videoId=${currentVideoId}&part=snippet&maxResults=50`;
-        if (pageToken) url += `&pageToken=${pageToken}`;
+        try {
+          const dbRes = await fetch(`http://localhost:5001/api/comments/${id}`);
+          const dbComments = await dbRes.json();
 
-        const res = await fetch(url);
-        const data = await res.json();
+          if (dbComments.length > 0) {
+            setComments(dbComments);
+            setTotalLoaded(dbComments.length);
 
-        if (!data.items || data.items.length === 0) break;
+            // ✅ Only fetch more if we don’t have enough
+            // ✅ Use fetchComments(false) to CONTINUE from where it left off
+            if (dbComments.length < 2500) {
+              fetchComments(false); // NOT true
+            }
 
-        if (isNew && data.pageInfo?.totalResults) {
-          setTotalResults(data.pageInfo.totalResults);
+          } else {
+            // No comments in DB → do a full fresh fetch
+            fetchComments(true);
+          }
+
+        } catch (err) {
+          console.error("DB fetch error:", err);
         }
 
-        const rawComments = data.items.map((item) => {
-          const snippet = item.snippet.topLevelComment.snippet;
-          return {
-            text: snippet.textDisplay,
-            likeCount: snippet.likeCount,
-            publishedAt: snippet.publishedAt,
-          };
-        });
+        setLoading(false);
+      };
 
-        setComments((prev) => [...prev, ...rawComments]);
-        pageToken = data.nextPageToken || null;
+      loadFromDatabase();
+    }, 1000); // wait 1s after user stops typing
 
-        if (!pageToken) done = true;
-        await new Promise((r) => setTimeout(r, 400)); // short delay to avoid quota spike
+    return () => clearTimeout(typingTimeout.current);
+  }, [videoLink]);
+
+
+
+  const fetchComments = async (forceFresh = false) => {
+    const videoId = extractVideoId(videoLink);
+    if (!videoId) return alert("Invalid YouTube URL");
+
+    setLoading(true);
+
+    try {
+      // 1. Try loading from MongoDB
+      const dbRes = await fetch(`http://localhost:5001/api/comments/${videoId}`);
+      const dbComments = await dbRes.json();
+
+      if (!forceFresh && dbComments.length > 0) {
+        setComments(dbComments);
+        setTotalLoaded(dbComments.length);
+        setLoading(false);
+        return;
       }
 
-      setNextPageToken(pageToken || null);
+      // 2. Get latest comment time
+      const latestRes = await fetch(`http://localhost:5001/api/comments/${videoId}/latest`);
+      const { latestPublishedAt } = await latestRes.json();
+      let latestTime = latestPublishedAt ? new Date(latestPublishedAt) : null;
+
+      // 3. Start fresh YouTube fetch
+      let allComments = forceFresh ? [] : [...comments];
+      let token = forceFresh ? null : nextPageToken;
+      let keepGoing = true;
+
+      while (keepGoing) {
+        let apiUrl = `https://www.googleapis.com/youtube/v3/commentThreads?key=${import.meta.env.VITE_YOUTUBE_API_KEY}&textFormat=plainText&part=snippet&videoId=${videoId}&maxResults=100`;
+        if (token) apiUrl += `&pageToken=${token}`;
+
+        const res = await fetch(apiUrl);
+        const data = await res.json();
+
+        const newComments = data.items?.map(item => {
+          const c = item.snippet.topLevelComment.snippet;
+          return {
+            text: c.textDisplay,
+            likeCount: c.likeCount,
+            publishedAt: c.publishedAt,
+            authorName: c.authorDisplayName,
+            authorUrl: c.authorChannelUrl,
+          };
+        }) || [];
+
+        // Stop if we reached old comments
+        if (latestTime) {
+          const cutoffIndex = newComments.findIndex(c => new Date(c.publishedAt) <= latestTime);
+          if (cutoffIndex !== -1) {
+            newComments.splice(cutoffIndex);
+            keepGoing = false;
+          }
+        }
+
+        allComments = [...allComments, ...newComments];
+        token = data.nextPageToken;
+
+        setComments(allComments);
+        setNextPageToken(token);
+        setTotalLoaded(allComments.length);
+
+        if (!token || shouldStop) keepGoing = false;
+      }
+
+      // Save fresh comments to DB
+      if (allComments.length > 0) {
+        await fetch('http://localhost:5001/api/comments/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ videoId, comments: allComments }),
+        });
+      }
+
     } catch (err) {
-      console.error("Error fetching comments:", err);
-      alert("Failed to fetch comments");
-    } finally {
-      setLoading(false);
+      console.error("Failed to fetch comments:", err);
     }
+
+    setLoading(false);
   };
 
 
@@ -94,8 +158,6 @@ function App() {
       return 0;
     }
   });
-
-
 
   return (
     <div style={{ padding: 20 }}>
@@ -196,14 +258,23 @@ function App() {
 
 
             {sortedComments.map((c, i) => (
-
               <div key={i} style={{ padding: 10, borderBottom: '1px solid #ccc' }}>
+                <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
+                  {c.authorUrl ? (
+                    <a href={c.authorUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#8d38e8', textDecoration: 'none' }}>
+                      {c.authorName}
+                    </a>
+                  ) : (
+                    c.authorName
+                  )}
+                </div>
                 <div dangerouslySetInnerHTML={{ __html: c.text }} />
-                <div style={{ fontSize: 12, color: '#555' }}>
+                <div style={{ fontSize: 12, color: '#38e861' }}>
                   👍 {c.likeCount} &nbsp; • &nbsp; {new Date(c.publishedAt).toLocaleString()}
                 </div>
               </div>
             ))}
+
             {nextPageToken && (
               <button
                 onClick={() => fetchComments(false)}
@@ -220,7 +291,5 @@ function App() {
       </div>
     </div>
   );
-
 }
-
 export default App;
